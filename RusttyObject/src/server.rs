@@ -52,14 +52,50 @@ impl ApiError {
         }
     }
 
+    fn upstream_network(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("Could not reach GitHub: {message}"),
+        }
+    }
+
     fn upstream(response: reqwest::Response) -> impl std::future::Future<Output = Self> {
         async move {
             let status =
                 StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "GitHub returned an error".to_string());
+            let message = match response.text().await {
+                Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                            .or_else(|| {
+                                value.get("errors").and_then(|errors| {
+                                    errors.as_array().map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(|item| {
+                                                item.get("message")
+                                                    .and_then(serde_json::Value::as_str)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                })
+                            })
+                    })
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| {
+                        if body.trim().is_empty() {
+                            "GitHub returned an error without details".to_string()
+                        } else {
+                            format!("GitHub returned an error: {}", body.trim())
+                        }
+                    }),
+                Err(_) => "GitHub returned an error without details".to_string(),
+            };
             Self { status, message }
         }
     }
@@ -308,6 +344,10 @@ pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/profile", get(profile))
         .route("/api/notifications", get(notifications))
         .route("/api/repositories/{owner}/{repo}/objects", get(objects))
+        .route(
+            "/api/repositories/{owner}/{repo}/buckets",
+            post(create_bucket),
+        )
         .route("/api/repositories/{owner}/{repo}/file", get(file_preview))
         .route("/api/repositories/{owner}/{repo}/files", post(upload_file))
         .layer(
@@ -562,6 +602,16 @@ async fn objects(
         .into_iter()
         .filter(|entry| entry.entry_type == "blob")
     {
+        if entry.path.ends_with("/.rustyobject") {
+            if let Some(bucket) = entry.path.strip_suffix("/.rustyobject") {
+                buckets.entry(bucket.to_string()).or_insert(BucketResponse {
+                    name: bucket.to_string(),
+                    objects: 0,
+                    size: 0,
+                });
+            }
+            continue;
+        }
         if entry.path == ".rustyobject" || entry.path == "config.rustyobject" {
             continue;
         }
@@ -622,6 +672,90 @@ async fn objects(
         objects,
         buckets,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBucketRequest {
+    name: String,
+    branch: Option<String>,
+    message: Option<String>,
+}
+
+async fn create_bucket(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(request): Json<CreateBucketRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = session_from_headers(&headers, &state).await?;
+    let bucket = validate_bucket_name(request.name)?;
+    let repository = github_get::<GithubRepository>(
+        &state.client,
+        &session.token,
+        &format!("/repos/{owner}/{repo}"),
+    )
+    .await?;
+    let branch = request
+        .branch
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(repository.default_branch);
+    let marker_path = format!("{bucket}/.rustyobject");
+    let encoded_path = marker_path
+        .split('/')
+        .map(|part| urlencoding::encode(part).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let endpoint = format!(
+        "/repos/{owner}/{repo}/contents/{encoded_path}?ref={}",
+        urlencoding::encode(&branch)
+    );
+    let existing = github_request(
+        &state.client,
+        &session.token,
+        reqwest::Method::GET,
+        &endpoint,
+    )
+    .send()
+    .await
+    .map_err(|error| ApiError::upstream_network(error.to_string()))?;
+    if existing.status().is_success() {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!("Bucket '{bucket}' already exists"),
+        });
+    }
+    if existing.status() != reqwest::StatusCode::NOT_FOUND {
+        return Err(ApiError::upstream(existing).await);
+    }
+
+    let payload = json!({
+        "message": request.message.unwrap_or_else(|| format!("Create bucket {bucket} via RusttyObject")),
+        "content": base64::engine::general_purpose::STANDARD.encode(b"RusttyObject bucket marker\n"),
+        "branch": branch,
+    });
+    let response = github_request(
+        &state.client,
+        &session.token,
+        reqwest::Method::PUT,
+        &format!("/repos/{owner}/{repo}/contents/{encoded_path}"),
+    )
+    .json(&payload)
+    .send()
+    .await
+    .map_err(|error| ApiError::upstream_network(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::upstream(response).await);
+    }
+    let result: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| ApiError::upstream_network(error.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "name": bucket,
+        "branch": branch,
+        "commit": result.get("commit").and_then(|commit| commit.get("sha")).cloned(),
+    })))
 }
 
 async fn file_preview(
@@ -895,6 +1029,31 @@ fn validate_path(path: String) -> Result<String, ApiError> {
     Ok(normalized)
 }
 
+fn validate_bucket_name(name: String) -> Result<String, ApiError> {
+    let normalized = name.trim().trim_matches('/').replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.len() > 100
+        || normalized.contains('/')
+        || normalized == "."
+        || normalized == ".."
+        || normalized == "root"
+        || normalized.starts_with('.')
+    {
+        return Err(ApiError::bad_request(
+            "Bucket names must be one non-empty path segment, up to 100 characters, and cannot start with a dot or use 'root'",
+        ));
+    }
+    if !normalized
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ' '))
+    {
+        return Err(ApiError::bad_request(
+            "Bucket names may contain only letters, numbers, spaces, hyphens, and underscores",
+        ));
+    }
+    Ok(normalized)
+}
+
 async fn github_repository_count(
     client: &Client,
     token: &str,
@@ -968,6 +1127,42 @@ fn github_request(
         .bearer_auth(token)
         .header(header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_bucket_name, validate_path};
+
+    #[test]
+    fn bucket_names_accept_safe_single_segments() {
+        assert_eq!(
+            validate_bucket_name(" product-images ".into()).unwrap(),
+            "product-images"
+        );
+        assert_eq!(
+            validate_bucket_name("user_uploads".into()).unwrap(),
+            "user_uploads"
+        );
+    }
+
+    #[test]
+    fn bucket_names_reject_paths_and_reserved_names() {
+        for name in ["", "root", ".hidden", "one/two", "../bucket", "a?b"] {
+            assert!(
+                validate_bucket_name(name.into()).is_err(),
+                "accepted invalid bucket: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_reject_traversal() {
+        assert!(validate_path("bucket/../secret".into()).is_err());
+        assert_eq!(
+            validate_path("bucket/file.txt".into()).unwrap(),
+            "bucket/file.txt"
+        );
+    }
 }
 
 async fn github_get<T: for<'de> Deserialize<'de>>(

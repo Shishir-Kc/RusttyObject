@@ -99,11 +99,12 @@ The server and CLI intentionally use separate credentials: browser OAuth session
 | `GET` | `/api/profile` | Load GitHub profile stats and recent activity |
 | `GET` | `/api/notifications` | Load unread GitHub notifications |
 | `GET` | `/api/repositories/:owner/:repo/objects` | Index the selected branch |
+| `POST` | `/api/repositories/:owner/:repo/buckets` | Create an empty bucket using a hidden marker file |
 | `GET` | `/api/repositories/:owner/:repo/file?path=...` | Authenticated inline preview/download |
 | `POST` | `/api/repositories/:owner/:repo/files` | Commit a multipart upload to GitHub |
 | `POST` | `/api/auth/logout` | End the browser session |
 
-Uploads accept `file`, `bucket`, `branch`, `path`, and `message` multipart fields. Files are limited to 100 MB by the GitHub Contents API path used here.
+Uploads accept `file`, `bucket`, `branch`, `path`, and `message` multipart fields. Files are limited to 100 MB by the GitHub Contents API path used here. Bucket creation accepts JSON `{ "name": "images", "branch": "main", "message": "optional commit message" }`; because Git does not store empty directories, RusttyObject creates `bucket/.rustyobject` and excludes that marker from the object index.
 
 ## Production notes
 
